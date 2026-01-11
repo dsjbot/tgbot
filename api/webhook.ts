@@ -11,7 +11,7 @@ const redis = new Redis({
 function getEnv() {
   return {
     token: process.env.TELEGRAM_BOT_TOKEN!,
-    whitelist: new Set(
+    whitelist: new Set<number>(
       (process.env.WHITELIST || '').split(',').filter(Boolean).map(id => parseInt(id.trim()))
     ),
     services: JSON.parse(process.env.AI_SERVICES || '{}') as AIServices,
