@@ -18,10 +18,24 @@ function getEnv() {
   };
 }
 
-async function callAI(config: AIServiceConfig, model: string, prompt: string): Promise<string> {
-  const messages: ChatMessage[] = [{ role: 'user', content: prompt }];
-
+async function callAI(config: AIServiceConfig, model: string, prompt: string, imageUrl?: string): Promise<string> {
   if (config.type === 'anthropic') {
+    const content: any[] = [];
+    
+    if (imageUrl) {
+      // 下载图片并转base64
+      const imgResponse = await fetch(imageUrl);
+      const imgBuffer = await imgResponse.arrayBuffer();
+      const base64 = Buffer.from(imgBuffer).toString('base64');
+      const mediaType = imgResponse.headers.get('content-type') || 'image/jpeg';
+      
+      content.push({
+        type: 'image',
+        source: { type: 'base64', media_type: mediaType, data: base64 }
+      });
+    }
+    content.push({ type: 'text', text: prompt });
+
     const response = await fetch(`${config.baseUrl}/messages`, {
       method: 'POST',
       headers: {
@@ -29,11 +43,24 @@ async function callAI(config: AIServiceConfig, model: string, prompt: string): P
         'x-api-key': config.apiKey,
         'anthropic-version': '2023-06-01',
       },
-      body: JSON.stringify({ model, max_tokens: 1000, messages }),
+      body: JSON.stringify({ 
+        model, 
+        max_tokens: 1000, 
+        messages: [{ role: 'user', content }] 
+      }),
     });
     const data = await response.json() as any;
     return data.content?.[0]?.text || 'No response';
   }
+
+  // OpenAI格式
+  const content: any[] = [];
+  if (imageUrl) {
+    content.push({ type: 'image_url', image_url: { url: imageUrl } });
+  }
+  content.push({ type: 'text', text: prompt });
+
+  const messages = [{ role: 'user', content: content.length === 1 ? prompt : content }];
 
   const response = await fetch(`${config.baseUrl}/chat/completions`, {
     method: 'POST',
@@ -67,6 +94,22 @@ async function sendMessage(token: string, chatId: number, text: string, replyMar
     parse_mode: 'Markdown',
     reply_markup: replyMarkup 
   });
+}
+
+// 获取图片URL
+async function getPhotoUrl(token: string, message: any): Promise<string | undefined> {
+  const photo = message.photo;
+  if (!photo || photo.length === 0) return undefined;
+  
+  // 获取最大尺寸的图片
+  const fileId = photo[photo.length - 1].file_id;
+  const fileResponse = await fetch(`https://api.telegram.org/bot${token}/getFile?file_id=${fileId}`);
+  const fileData = await fileResponse.json() as any;
+  
+  if (fileData.ok && fileData.result.file_path) {
+    return `https://api.telegram.org/file/bot${token}/${fileData.result.file_path}`;
+  }
+  return undefined;
 }
 
 // 从Redis获取用户会话
@@ -141,11 +184,28 @@ async function handleMessage(token: string, message: any, whitelist: Set<number>
   }
 
   // AI对话
-  if (text && !text.startsWith('/')) {
+  const msgText = text || message.caption || '';
+  if (msgText && !msgText.startsWith('/')) {
     await tgApi(token, 'sendChatAction', { chat_id: chatId, action: 'typing' });
+    
+    // 处理引用消息
+    let prompt = msgText;
+    const replyTo = message.reply_to_message;
+    if (replyTo?.text) {
+      prompt = `引用内容:\n"""\n${replyTo.text}\n"""\n\n我的问题: ${msgText}`;
+    } else if (replyTo?.caption) {
+      prompt = `引用内容:\n"""\n${replyTo.caption}\n"""\n\n我的问题: ${msgText}`;
+    }
+    
+    // 获取图片 (当前消息或引用消息)
+    let imageUrl = await getPhotoUrl(token, message);
+    if (!imageUrl && replyTo) {
+      imageUrl = await getPhotoUrl(token, replyTo);
+    }
+    
     try {
       const svc = services[session.currentService];
-      const response = await callAI(svc, session.currentModel, text);
+      const response = await callAI(svc, session.currentModel, prompt, imageUrl);
       await sendMessage(token, chatId, response);
     } catch (e) {
       await sendMessage(token, chatId, `❌ 请求失败: ${e}`);
