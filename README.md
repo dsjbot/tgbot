@@ -40,28 +40,40 @@
 
 ### 方式一：部署到 Vercel（推荐，简单）
 
-#### 步骤1：Fork仓库
+#### 步骤1：创建Upstash Redis数据库
+
+1. 访问 [Upstash Console](https://console.upstash.com)，注册/登录
+2. 点击 `Create Database`
+3. 选择区域（推荐选离你近的），点击 `Create`
+4. 在数据库详情页，找到 `REST API` 部分
+5. 复制 `UPSTASH_REDIS_REST_URL` 和 `UPSTASH_REDIS_REST_TOKEN`
+
+> 💡 Upstash免费套餐每天10,000请求，足够个人使用
+
+#### 步骤2：Fork仓库
 点击GitHub页面右上角的 `Fork` 按钮，将仓库复制到你的账号下。
 
-#### 步骤2：导入到Vercel
+#### 步骤3：导入到Vercel
 1. 访问 [Vercel](https://vercel.com)，使用GitHub登录
 2. 点击 `Add New Project`
 3. 选择你fork的 `tgbot` 仓库
 4. 点击 `Import`
 
-#### 步骤3：配置环境变量
+#### 步骤4：配置环境变量
 在部署页面，展开 `Environment Variables`，添加以下变量：
 
 | 变量名 | 值 | 说明 |
 |--------|-----|------|
 | `TELEGRAM_BOT_TOKEN` | `123456789:ABC...` | 从BotFather获取 |
 | `WHITELIST` | `123456789,987654321` | 允许使用的用户ID，逗号分隔，留空允许所有人 |
+| `UPSTASH_REDIS_REST_URL` | `https://xxx.upstash.io` | 从Upstash控制台获取 |
+| `UPSTASH_REDIS_REST_TOKEN` | `AXxxxx...` | 从Upstash控制台获取 |
 | `AI_SERVICES` | `{"openai":{...}}` | AI服务配置JSON（见下方） |
 
-#### 步骤4：部署
+#### 步骤5：部署
 点击 `Deploy`，等待部署完成。
 
-#### 步骤5：设置Webhook
+#### 步骤6：设置Webhook
 部署完成后，访问：
 ```
 https://你的项目名.vercel.app/setWebhook
@@ -222,9 +234,7 @@ https://你的worker名.你的子域.workers.dev/setWebhook
 修改 `AI_SERVICES` 环境变量，添加新的服务配置即可。
 
 ### Q: Vercel部署后会话不保存？
-Vercel是无状态的，每次请求可能在不同实例。如需持久化会话，建议：
-1. 使用Cloudflare Workers + KV
-2. 或接入Redis等外部存储
+现在已集成Upstash Redis，会话会持久化保存30天。确保正确配置了 `UPSTASH_REDIS_REST_URL` 和 `UPSTASH_REDIS_REST_TOKEN`。
 
 ---
 

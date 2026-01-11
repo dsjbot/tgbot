@@ -8,7 +8,7 @@
     "deploy:vercel": "vercel --prod"
   },
   "dependencies": {
-    "grammy": "^1.21.1"
+    "@upstash/redis": "^1.28.0"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20240117.0",

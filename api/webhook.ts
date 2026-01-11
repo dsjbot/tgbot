@@ -1,8 +1,12 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
+import { Redis } from '@upstash/redis';
 import type { AIServices, UserSession, InlineQueryResult, AIServiceConfig, ChatMessage } from '../src/types';
 
-// 简化的内存存储 (Vercel无状态，生产环境建议用Redis/KV)
-const sessions = new Map<number, UserSession>();
+// Upstash Redis客户端
+const redis = new Redis({
+  url: process.env.UPSTASH_REDIS_REST_URL!,
+  token: process.env.UPSTASH_REDIS_REST_TOKEN!,
+});
 
 function getEnv() {
   return {
@@ -51,18 +55,30 @@ async function answerInlineQuery(token: string, queryId: string, results: Inline
   });
 }
 
-function getSession(userId: number, services: AIServices): UserSession {
-  if (sessions.has(userId)) return sessions.get(userId)!;
+// 从Redis获取用户会话
+async function getSession(userId: number, services: AIServices): Promise<UserSession> {
+  const cached = await redis.get<UserSession>(`session:${userId}`);
+  if (cached) return cached;
+  
   const serviceNames = Object.keys(services);
   const defaultService = serviceNames[0];
-  return { currentService: defaultService, currentModel: services[defaultService].models[0] };
+  return { 
+    currentService: defaultService, 
+    currentModel: services[defaultService].models[0] 
+  };
+}
+
+// 保存用户会话到Redis
+async function saveSession(userId: number, session: UserSession): Promise<void> {
+  await redis.set(`session:${userId}`, session, { ex: 86400 * 30 }); // 30天过期
 }
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   const { token, whitelist, services } = getEnv();
   const url = new URL(req.url!, `https://${req.headers.host}`);
 
-  if (url.pathname === '/setWebhook' || url.pathname === '/api/webhook' && req.method === 'GET') {
+  // 设置Webhook
+  if (url.pathname === '/setWebhook' || (url.pathname === '/api/webhook' && req.method === 'GET')) {
     const webhookUrl = `https://${req.headers.host}/webhook`;
     const response = await fetch(`https://api.telegram.org/bot${token}/setWebhook`, {
       method: 'POST',
@@ -98,7 +114,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.send('OK');
   }
 
-  const session = getSession(userId, services);
+  const session = await getSession(userId, services);
   let results: InlineQueryResult[] = [];
 
   // 命令处理
@@ -125,7 +141,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     if (services[name]) {
       session.currentService = name;
       session.currentModel = services[name].models[0];
-      sessions.set(userId, session);
+      await saveSession(userId, session);
       results.push({
         type: 'article', id: 'ok', title: `✅ 已切换到 ${name}`,
         input_message_content: { message_text: `已切换: ${name} / ${session.currentModel}` },
@@ -135,7 +151,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const model = text.slice(7).trim();
     if (services[session.currentService].models.includes(model)) {
       session.currentModel = model;
-      sessions.set(userId, session);
+      await saveSession(userId, session);
       results.push({
         type: 'article', id: 'ok', title: `✅ 已切换到 ${model}`,
         input_message_content: { message_text: `已切换模型: ${model}` },
