@@ -1,14 +1,9 @@
 {
   "version": 2,
-  "builds": [
-    {
-      "src": "api/webhook.ts",
-      "use": "@vercel/node"
-    }
-  ],
-  "routes": [
-    { "src": "/webhook", "dest": "/api/webhook" },
-    { "src": "/setWebhook", "dest": "/api/webhook" },
-    { "src": "/health", "dest": "/api/webhook" }
+  "rewrites": [
+    { "source": "/webhook", "destination": "/api/webhook" },
+    { "source": "/setWebhook", "destination": "/api/webhook" },
+    { "source": "/health", "destination": "/api/webhook" },
+    { "source": "/", "destination": "/api/webhook" }
   ]
 }
