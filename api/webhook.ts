@@ -47,11 +47,25 @@ async function callAI(config: AIServiceConfig, model: string, prompt: string): P
   return data.choices?.[0]?.message?.content || 'No response';
 }
 
-async function answerInlineQuery(token: string, queryId: string, results: InlineQueryResult[]) {
-  await fetch(`https://api.telegram.org/bot${token}/answerInlineQuery`, {
+// Telegram API调用
+async function tgApi(token: string, method: string, body: any) {
+  await fetch(`https://api.telegram.org/bot${token}/${method}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ inline_query_id: queryId, results, cache_time: 0 }),
+    body: JSON.stringify(body),
+  });
+}
+
+async function answerInlineQuery(token: string, queryId: string, results: InlineQueryResult[]) {
+  await tgApi(token, 'answerInlineQuery', { inline_query_id: queryId, results, cache_time: 0 });
+}
+
+async function sendMessage(token: string, chatId: number, text: string, replyMarkup?: any) {
+  await tgApi(token, 'sendMessage', { 
+    chat_id: chatId, 
+    text, 
+    parse_mode: 'Markdown',
+    reply_markup: replyMarkup 
   });
 }
 
@@ -70,54 +84,121 @@ async function getSession(userId: number, services: AIServices): Promise<UserSes
 
 // 保存用户会话到Redis
 async function saveSession(userId: number, session: UserSession): Promise<void> {
-  await redis.set(`session:${userId}`, session, { ex: 86400 * 30 }); // 30天过期
+  await redis.set(`session:${userId}`, session, { ex: 86400 * 30 });
 }
 
-export default async function handler(req: VercelRequest, res: VercelResponse) {
-  const { token, whitelist, services } = getEnv();
-  const url = new URL(req.url!, `https://${req.headers.host}`);
+// 处理私聊消息
+async function handleMessage(token: string, message: any, whitelist: Set<number>, services: AIServices) {
+  const chatId = message.chat.id;
+  const userId = message.from.id;
+  const text = message.text?.trim() || '';
 
-  // 设置Webhook
-  if (url.pathname === '/setWebhook' || (url.pathname === '/api/webhook' && req.method === 'GET')) {
-    const webhookUrl = `https://${req.headers.host}/webhook`;
-    const response = await fetch(`https://api.telegram.org/bot${token}/setWebhook`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url: webhookUrl }),
-    });
-    return res.json(await response.json());
+  // 白名单检查 - 无权限用户静默忽略
+  if (whitelist.size > 0 && !whitelist.has(userId)) {
+    return;
   }
 
-  if (url.pathname === '/health') {
-    return res.send('OK');
+  const session = await getSession(userId, services);
+
+  // 命令处理
+  if (text === '/start' || text === '/help') {
+    const helpText = `🤖 *AI Bot*
+
+当前: \`${session.currentService}\` / \`${session.currentModel}\`
+
+*命令:*
+/services - 切换AI服务
+/models - 切换模型
+/status - 查看当前状态
+
+直接发送消息即可与AI对话`;
+    await sendMessage(token, chatId, helpText);
+    return;
   }
 
-  if (req.method !== 'POST') {
-    return res.send('Telegram AI Bot');
+  if (text === '/status' || text === '/st') {
+    await sendMessage(token, chatId, `📊 当前服务: \`${session.currentService}\`\n当前模型: \`${session.currentModel}\``);
+    return;
   }
 
-  const update = req.body;
-  if (!update?.inline_query) {
-    return res.send('OK');
+  if (text === '/services' || text === '/s') {
+    const buttons = Object.entries(services).map(([name, config]) => [{
+      text: `${name === session.currentService ? '✅' : '⬜'} ${name} (${config.type})`,
+      callback_data: `svc:${name}`
+    }]);
+    await sendMessage(token, chatId, '选择AI服务:', { inline_keyboard: buttons });
+    return;
   }
 
-  const query = update.inline_query;
+  if (text === '/models' || text === '/m') {
+    const svc = services[session.currentService];
+    const buttons = svc.models.map(model => [{
+      text: `${model === session.currentModel ? '✅' : '⬜'} ${model}`,
+      callback_data: `mdl:${model}`
+    }]);
+    await sendMessage(token, chatId, `选择模型 (${session.currentService}):`, { inline_keyboard: buttons });
+    return;
+  }
+
+  // AI对话
+  if (text && !text.startsWith('/')) {
+    await tgApi(token, 'sendChatAction', { chat_id: chatId, action: 'typing' });
+    try {
+      const svc = services[session.currentService];
+      const response = await callAI(svc, session.currentModel, text);
+      await sendMessage(token, chatId, response);
+    } catch (e) {
+      await sendMessage(token, chatId, `❌ 请求失败: ${e}`);
+    }
+  }
+}
+
+// 处理回调按钮
+async function handleCallback(token: string, callback: any, services: AIServices) {
+  const userId = callback.from.id;
+  const chatId = callback.message.chat.id;
+  const data = callback.data;
+  const session = await getSession(userId, services);
+
+  if (data.startsWith('svc:')) {
+    const name = data.slice(4);
+    if (services[name]) {
+      session.currentService = name;
+      session.currentModel = services[name].models[0];
+      await saveSession(userId, session);
+      await tgApi(token, 'answerCallbackQuery', { 
+        callback_query_id: callback.id, 
+        text: `已切换到 ${name}` 
+      });
+      await sendMessage(token, chatId, `✅ 已切换到 \`${name}\` / \`${session.currentModel}\``);
+    }
+  } else if (data.startsWith('mdl:')) {
+    const model = data.slice(4);
+    if (services[session.currentService].models.includes(model)) {
+      session.currentModel = model;
+      await saveSession(userId, session);
+      await tgApi(token, 'answerCallbackQuery', { 
+        callback_query_id: callback.id, 
+        text: `已切换到 ${model}` 
+      });
+      await sendMessage(token, chatId, `✅ 已切换到模型 \`${model}\``);
+    }
+  }
+}
+
+// 处理Inline Query
+async function handleInlineQuery(token: string, query: any, whitelist: Set<number>, services: AIServices) {
   const userId = query.from.id;
   const text = query.query.trim();
 
-  // 白名单检查
+  // 无权限用户静默忽略
   if (whitelist.size > 0 && !whitelist.has(userId)) {
-    await answerInlineQuery(token, query.id, [{
-      type: 'article', id: 'denied', title: '⛔ 无权限',
-      input_message_content: { message_text: '您没有使用此机器人的权限' },
-    }]);
-    return res.send('OK');
+    return;
   }
 
   const session = await getSession(userId, services);
   let results: InlineQueryResult[] = [];
 
-  // 命令处理
   if (text === '/s' || text === '/services') {
     for (const [name, config] of Object.entries(services)) {
       results.push({
@@ -167,7 +248,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         input_message_content: { message_text: '/m' } },
     ];
   } else {
-    // AI查询
     try {
       const svc = services[session.currentService];
       const response = await callAI(svc, session.currentModel, text);
@@ -185,5 +265,47 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   await answerInlineQuery(token, query.id, results);
+}
+
+export default async function handler(req: VercelRequest, res: VercelResponse) {
+  const { token, whitelist, services } = getEnv();
+  const url = new URL(req.url!, `https://${req.headers.host}`);
+
+  // 设置Webhook
+  if (url.pathname === '/setWebhook' || (url.pathname === '/api/webhook' && req.method === 'GET')) {
+    const webhookUrl = `https://${req.headers.host}/webhook`;
+    const response = await fetch(`https://api.telegram.org/bot${token}/setWebhook`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: webhookUrl }),
+    });
+    return res.json(await response.json());
+  }
+
+  if (url.pathname === '/health') {
+    return res.send('OK');
+  }
+
+  if (req.method !== 'POST') {
+    return res.send('Telegram AI Bot');
+  }
+
+  const update = req.body;
+
+  // 处理私聊消息
+  if (update?.message) {
+    await handleMessage(token, update.message, whitelist, services);
+  }
+  
+  // 处理回调按钮
+  if (update?.callback_query) {
+    await handleCallback(token, update.callback_query, services);
+  }
+
+  // 处理Inline Query
+  if (update?.inline_query) {
+    await handleInlineQuery(token, update.inline_query, whitelist, services);
+  }
+
   res.send('OK');
 }
