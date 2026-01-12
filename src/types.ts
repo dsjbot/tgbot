@@ -14,6 +14,12 @@ export interface AIServices {
 export interface UserSession {
   currentService: string;
   currentModel: string;
+  contextEnabled: boolean; // 是否启用上下文
+}
+
+// 对话历史
+export interface ChatHistory {
+  messages: ChatMessage[];
 }
 
 // 环境变量

@@ -18,12 +18,13 @@ function getEnv() {
   };
 }
 
-async function callAI(config: AIServiceConfig, model: string, prompt: string, imageUrl?: string): Promise<string> {
+async function callAI(config: AIServiceConfig, model: string, prompt: string, imageUrl?: string, history?: ChatMessage[]): Promise<string> {
+  const messages: any[] = history ? [...history] : [];
+  
   if (config.type === 'anthropic') {
     const content: any[] = [];
     
     if (imageUrl) {
-      // 下载图片并转base64
       const imgResponse = await fetch(imageUrl);
       const imgBuffer = await imgResponse.arrayBuffer();
       const base64 = Buffer.from(imgBuffer).toString('base64');
@@ -35,6 +36,13 @@ async function callAI(config: AIServiceConfig, model: string, prompt: string, im
       });
     }
     content.push({ type: 'text', text: prompt });
+    
+    // Anthropic格式的历史消息
+    const anthropicMessages = messages.map(m => ({
+      role: m.role,
+      content: m.content
+    }));
+    anthropicMessages.push({ role: 'user', content });
 
     const response = await fetch(`${config.baseUrl}/messages`, {
       method: 'POST',
@@ -46,7 +54,7 @@ async function callAI(config: AIServiceConfig, model: string, prompt: string, im
       body: JSON.stringify({ 
         model, 
         max_tokens: 1000, 
-        messages: [{ role: 'user', content }] 
+        messages: anthropicMessages 
       }),
     });
     const data = await response.json() as any;
@@ -60,7 +68,7 @@ async function callAI(config: AIServiceConfig, model: string, prompt: string, im
   }
   content.push({ type: 'text', text: prompt });
 
-  const messages = [{ role: 'user', content: content.length === 1 ? prompt : content }];
+  messages.push({ role: 'user', content: content.length === 1 ? prompt : content });
 
   const response = await fetch(`${config.baseUrl}/chat/completions`, {
     method: 'POST',
@@ -115,19 +123,38 @@ async function getPhotoUrl(token: string, message: any): Promise<string | undefi
 // 从Redis获取用户会话
 async function getSession(userId: number, services: AIServices): Promise<UserSession> {
   const cached = await redis.get<UserSession>(`session:${userId}`);
-  if (cached) return cached;
+  if (cached) return { contextEnabled: false, ...cached };
   
   const serviceNames = Object.keys(services);
   const defaultService = serviceNames[0];
   return { 
     currentService: defaultService, 
-    currentModel: services[defaultService].models[0] 
+    currentModel: services[defaultService].models[0],
+    contextEnabled: false
   };
 }
 
 // 保存用户会话到Redis
 async function saveSession(userId: number, session: UserSession): Promise<void> {
   await redis.set(`session:${userId}`, session, { ex: 86400 * 30 });
+}
+
+// 获取对话历史
+async function getChatHistory(userId: number): Promise<ChatMessage[]> {
+  const history = await redis.get<ChatMessage[]>(`history:${userId}`);
+  return history || [];
+}
+
+// 保存对话历史
+async function saveChatHistory(userId: number, messages: ChatMessage[]): Promise<void> {
+  // 只保留最近10轮对话
+  const trimmed = messages.slice(-20);
+  await redis.set(`history:${userId}`, trimmed, { ex: 86400 }); // 1天过期
+}
+
+// 清除对话历史
+async function clearChatHistory(userId: number): Promise<void> {
+  await redis.del(`history:${userId}`);
 }
 
 // 处理私聊消息
@@ -145,14 +172,18 @@ async function handleMessage(token: string, message: any, whitelist: Set<number>
 
   // 命令处理
   if (text === '/start' || text === '/help') {
+    const contextStatus = session.contextEnabled ? '✅ 开启' : '❌ 关闭';
     const helpText = `🤖 *AI Bot*
 
 当前: \`${session.currentService}\` / \`${session.currentModel}\`
+上下文: ${contextStatus}
 
 *命令:*
 /services - 切换AI服务
 /models - 切换模型
 /status - 查看当前状态
+/context - 开关上下文记忆
+/clear - 清除对话历史
 
 直接发送消息即可与AI对话`;
     await sendMessage(token, chatId, helpText);
@@ -160,7 +191,25 @@ async function handleMessage(token: string, message: any, whitelist: Set<number>
   }
 
   if (text === '/status' || text === '/st') {
-    await sendMessage(token, chatId, `📊 当前服务: \`${session.currentService}\`\n当前模型: \`${session.currentModel}\``);
+    const contextStatus = session.contextEnabled ? '✅ 开启' : '❌ 关闭';
+    await sendMessage(token, chatId, `📊 当前服务: \`${session.currentService}\`\n当前模型: \`${session.currentModel}\`\n上下文: ${contextStatus}`);
+    return;
+  }
+
+  if (text === '/context' || text === '/ctx') {
+    session.contextEnabled = !session.contextEnabled;
+    await saveSession(userId, session);
+    if (!session.contextEnabled) {
+      await clearChatHistory(userId);
+    }
+    const status = session.contextEnabled ? '✅ 已开启上下文记忆' : '❌ 已关闭上下文记忆';
+    await sendMessage(token, chatId, status);
+    return;
+  }
+
+  if (text === '/clear') {
+    await clearChatHistory(userId);
+    await sendMessage(token, chatId, '🗑️ 对话历史已清除');
     return;
   }
 
@@ -203,10 +252,23 @@ async function handleMessage(token: string, message: any, whitelist: Set<number>
       imageUrl = await getPhotoUrl(token, replyTo);
     }
     
+    // 获取对话历史
+    let history: ChatMessage[] = [];
+    if (session.contextEnabled) {
+      history = await getChatHistory(userId);
+    }
+    
     try {
       const svc = services[session.currentService];
-      const response = await callAI(svc, session.currentModel, prompt, imageUrl);
+      const response = await callAI(svc, session.currentModel, prompt, imageUrl, history);
       await sendMessage(token, chatId, response);
+      
+      // 保存对话历史
+      if (session.contextEnabled) {
+        history.push({ role: 'user', content: prompt });
+        history.push({ role: 'assistant', content: response });
+        await saveChatHistory(userId, history);
+      }
     } catch (e) {
       await sendMessage(token, chatId, `❌ 请求失败: ${e}`);
     }
